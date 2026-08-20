@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-import json
 import sys
 import threading
+from typing import Any
 
 from .config import get_config
 from .core import WebX
@@ -116,7 +116,7 @@ def create_server():
         page: int = 1,
         time_range: str | None = None,
         safe_search: int | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Search via local SearXNG."""
         # Validate limit
         if limit < 1 or limit > 50:
@@ -146,8 +146,9 @@ def create_server():
                 time_range=time_range,
                 safe_search=safe_search,
             )
-            # Return JSON string; MCP client will receive text
-            return json.dumps(resp.to_dict(), ensure_ascii=False)
+            # Return dict for structured_content; MCPServer will also render
+            # unstructured text as JSON for backwards compat.
+            return resp.to_dict()
         except WebXError as e:
             # Map typed errors to concise tool errors, no traceback
             if e.exit_code == 3:
@@ -173,7 +174,7 @@ def create_server():
         max_chars: int = 40000,
         include_links: bool = False,
         include_tables: bool = True,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Read and extract a public URL."""
         if max_chars < 1000 or max_chars > 500000:
             raise ToolError("max_chars must be between 1000 and 500000")
@@ -184,7 +185,7 @@ def create_server():
                 include_links=include_links,
                 include_tables=include_tables,
             )
-            return json.dumps(resp.to_dict(), ensure_ascii=False)
+            return resp.to_dict()
         except WebXError as e:
             if e.exit_code == 5:
                 raise ToolError(f"unsafe URL: {e}") from None

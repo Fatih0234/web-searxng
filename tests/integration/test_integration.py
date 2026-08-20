@@ -45,15 +45,15 @@ def test_local_searxng_smoke(tmp_path):
         pytest.skip("docker not available")
 
     core = WebX(cfg)
-    # stable query; if upstream engines blocked or no net, this may fail; provide skip
-    try:
-        resp = core.search("SearXNG documentation", limit=2)
-    except Exception as e:
-        # If search fails due to engine rate limit or no docker, skip not fail
-        pytest.skip(f"search skipped due to environment: {e}")
+    # Search failure after Docker preflight is a local regression, not an environmental skip.
+    # Only docker absence is skipped above.
+    resp = core.search("SearXNG documentation", limit=2)
 
     assert resp.query == "SearXNG documentation"
-    assert len(resp.results) >= 0  # may be 0 if engines blocked, but schema must be valid
+    # 0 results is valid (engines may be rate-limited), but schema must be valid and bounded by limit
+    assert 0 <= len(resp.results) <= 2
+    assert resp.meta.result_count == len(resp.results)
+    assert resp.meta.page == 1
     for r in resp.results:
         assert r.url.startswith("http")
         assert isinstance(r.title, str)
@@ -81,12 +81,17 @@ def test_live_reader_example(tmp_path):
 
     cfg = get_config()
     init_runtime(cfg)
-    core = WebX(cfg)
-    # This needs internet; skip if fails
+    # Preflight: skip only if external network is clearly unavailable, not on WebX regressions.
+    # A plain socket check distinguishes “no internet” from a WebX bug that blocks example.com.
+    import socket as _socket
+
     try:
-        resp = core.read("https://example.com", max_chars=5000)
-    except Exception as e:
-        pytest.skip(f"live reader skipped: {e}")
+        _socket.create_connection(("example.com", 80), timeout=2).close()
+    except OSError as e:
+        pytest.skip(f"no external network for live reader: {e}")
+
+    core = WebX(cfg)
+    resp = core.read("https://example.com", max_chars=5000)
     assert "Example Domain" in resp.content or "domain" in resp.content.lower()
     assert resp.truncated is False
     assert resp.final_url.startswith("https://example.com")

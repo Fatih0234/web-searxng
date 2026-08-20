@@ -83,11 +83,17 @@ def init_runtime(cfg: WebXConfig, *, force_templates: bool = False, show_path: b
 
 
 def probe_http(url: str, timeout: float = 3.0) -> bool:
-    """Probe SearXNG root URL. Public for testing."""
+    """Probe SearXNG root URL. Public for testing.
+
+    Requires 2xx (preferably 200) to consider the service healthy; 4xx
+    (e.g. 403/404 from an intercepting proxy or misconfigured instance)
+    must not be treated as running.
+    Uses trust_env=False to avoid proxy-mediated false positives.
+    """
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=False) as c:
+        with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as c:
             r = c.get(url if url.endswith("/") else url + "/")
-            return 200 <= r.status_code < 500  # reachable if not connection error
+            return 200 <= r.status_code < 300
     except Exception:
         return False
 
@@ -213,29 +219,20 @@ def doctor(cfg: WebXConfig) -> DoctorReport:
 def compose_up(cfg: WebXConfig, verbose: bool = False) -> subprocess.CompletedProcess:
     """Run docker compose up -d. Uses list args, no shell.
 
-    Handles the edge where multiple WEBX_DATA_DIR temps share the same container_name
-    (webx-searxng) — if Docker reports name conflict, remove the stale container and retry
-    once. Production single-runtime is unaffected.
+    On container-name collision (e.g. "webx-searxng already in use"),
+    this function no longer performs destructive ``docker rm -f``.
+    A collision indicates another WebX instance or stale container may be
+    active; automatically deleting it would violate the non-destructive
+    guarantee for implicit ``search`` startup. Callers should surface the
+    error so the user can inspect with ``docker ps`` / ``webx logs`` and
+    run an explicit ``webx down`` / ``docker rm`` if cleanup is desired.
     """
-    result = subprocess.run(
+    return subprocess.run(
         [cfg.docker_cmd, "compose", "-f", str(cfg.compose_file), "up", "-d"],
         capture_output=True,
         text=True,
         timeout=30,
     )
-    if result.returncode != 0 and "already in use" in (result.stderr or "") and "webx-searxng" in (result.stderr or ""):
-        # Try to remove stale container from a previous temp runtime and retry once
-        try:
-            subprocess.run([cfg.docker_cmd, "rm", "-f", "webx-searxng"], capture_output=True, text=True, timeout=10)
-        except Exception:
-            pass
-        result = subprocess.run(
-            [cfg.docker_cmd, "compose", "-f", str(cfg.compose_file), "up", "-d"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    return result
 
 
 def compose_down(cfg: WebXConfig, verbose: bool = False) -> subprocess.CompletedProcess | None:
@@ -279,7 +276,13 @@ def ensure_running(cfg: WebXConfig, verbose: bool = False) -> RuntimeStatus:
     try:
         result = compose_up(cfg, verbose=verbose)
         if result.returncode != 0:
-            raise SearxngStartupError(f"docker compose up failed: {result.stderr or result.stdout}")
+            msg = result.stderr or result.stdout or ""
+            if "already in use" in msg and "webx-searxng" in msg:
+                raise SearxngStartupError(
+                    f"docker compose up failed: container webx-searxng already in use: {msg.strip()}",
+                    hint="another WebX instance may be running — inspect with `docker ps -a --filter name=webx-searxng` and `docker logs webx-searxng`; remove only with explicit `docker rm -f webx-searxng` or `webx down` if safe",
+                )
+            raise SearxngStartupError(f"docker compose up failed: {msg.strip()}")
     except FileNotFoundError as e:
         raise DockerUnavailableError(f"docker not found: {e}") from e
 
@@ -307,26 +310,44 @@ def ensure_running(cfg: WebXConfig, verbose: bool = False) -> RuntimeStatus:
     raise SearxngStartupError(f"SearXNG did not become ready within {cfg.startup_timeout}s at {cfg.searxng_url}", hint=logs[:1000] if logs else None)
 
 
-def compose_stop(cfg: WebXConfig, verbose: bool = False) -> None:
+def compose_stop(cfg: WebXConfig, verbose: bool = False) -> subprocess.CompletedProcess | None:
+    """Stop SearXNG via ``docker compose stop``. Idempotent when already stopped.
+
+    Raises a typed :class:`WebXError` on genuine failure (non-zero exit,
+    docker unavailable, etc.) so callers can distinguish success from
+    failure. Already-stopped is success (compose returns 0).
+    """
+    from .errors import RuntimeError as WebXRuntimeError
+
     if not cfg.compose_file.exists():
         if verbose:
             print("no runtime compose file, nothing to stop", file=sys.stderr)
-        return
+        return None
     if not _docker_available(cfg):
         if verbose:
             print("docker not available, skip stop", file=sys.stderr)
-        return
+        return None
     try:
-        subprocess.run(
+        result = subprocess.run(
             [cfg.docker_cmd, "compose", "-f", str(cfg.compose_file), "stop"],
             capture_output=True,
             text=True,
             timeout=30,
         )
+    except FileNotFoundError as e:
+        raise WebXRuntimeError(f"docker not found: {e}", hint="Install Docker/Compose") from e
     except Exception as e:
         if verbose:
             print(f"stop error: {e}", file=sys.stderr)
-    # idempotent: success even if already stopped
+        raise WebXRuntimeError(f"docker compose stop failed: {e}") from e
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout or "").strip()
+        raise WebXRuntimeError(
+            f"docker compose stop failed (exit {result.returncode}): {msg}",
+            hint="check `docker ps` and `webx logs`",
+        )
+    # idempotent: already stopped returns 0, so success
+    return result
 
 
 

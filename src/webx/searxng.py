@@ -177,7 +177,7 @@ class SearxngClient:
         url = self.config.searxng_url.rstrip("/") + "/search"
 
         try:
-            with httpx.Client(timeout=self.config.search_timeout, follow_redirects=False) as client:
+            with httpx.Client(timeout=self.config.search_timeout, follow_redirects=False, trust_env=False) as client:
                 resp = client.get(url, params=params, headers={"Accept": "application/json"})
         except httpx.TimeoutException as e:
             raise SearxngSearchError(f"SearXNG search timeout: {e}") from e

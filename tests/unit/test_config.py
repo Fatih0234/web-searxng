@@ -23,10 +23,15 @@ def test_config_env_overrides(monkeypatch):
 def test_config_invalid_timeout(monkeypatch):
     monkeypatch.setenv("WEBX_STARTUP_TIMEOUT", "-1")
     from webx.config import get_config
+    from webx.errors import UsageError, WebXError
+
     try:
         get_config()
         assert False, "should raise"
+    except (UsageError, WebXError):
+        pass
     except ValueError:
+        # Backwards compat: UsageError is now raised, but ValueError was previously expected
         pass
 
 def test_config_default_url_stripped(monkeypatch):

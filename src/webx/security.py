@@ -58,17 +58,24 @@ def _check_hostname_literal(host: str) -> None:
 
 
 def _resolve_and_check(host: str) -> None:
-    """Resolve hostname via OS resolver and deny if any IP is unsafe."""
-    # Already checked literal IP; for domain names, try getaddrinfo
-    # If host is literal IP we already checked, but still need to check via getaddrinfo? Do both.
+    """Resolve hostname via OS resolver and deny if any IP is unsafe.
+
+    Fails closed when DNS resolution cannot establish that the target is
+    public — prevents proxy-mediated bypass where a local resolver cannot
+    resolve an internal name but a corporate HTTP proxy could.
+    """
     try:
         infos = socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
-    except socket.gaierror:
-        # DNS failure — treat as not denied here; fetch will fail later with FetchError.
-        # Do not leak resolver details.
-        return
-    except Exception:
-        return
+    except socket.gaierror as e:
+        raise UnsafeUrlError(
+            f"DNS resolution failed for {host!r}: {e}",
+            hint="unable to verify target is public — blocked",
+        ) from e
+    except Exception as e:
+        raise UnsafeUrlError(
+            f"DNS resolution error for {host!r}: {e}",
+            hint="unable to verify target is public — blocked",
+        ) from e
 
     for family, type_, proto, canonname, sockaddr in infos:
         ip_str = sockaddr[0]

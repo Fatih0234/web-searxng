@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import time
 import urllib.parse
 
 import httpx
@@ -84,13 +86,30 @@ class WebReader:
         visited: set[str] = set()
         final_url: str | None = None
         final_content_type: str | None = None
+        final_content_type_full: str | None = None
         body_bytes: bytes | None = None
+        # Absolute wall-clock deadline for the entire fetch (redirects + body).
+        # httpx read timeout is per-chunk; this deadline bounds total time.
+        deadline = time.monotonic() + self.config.read_timeout
 
         for _ in range(_MAX_REDIRECTS + 1):
+            # Check overall deadline before each hop
+            remaining_overall = deadline - time.monotonic()
+            if remaining_overall <= 0:
+                raise FetchError(f"Overall read timeout {self.config.read_timeout}s exceeded for {url}")
             # Validate every hop
             validate_url(current_url, self.config)
 
-            timeout = httpx.Timeout(connect=5.0, read=self.config.read_timeout, write=5.0, pool=5.0)
+            # Remaining time bounds all network waits for this hop
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise FetchError(f"Overall read timeout {self.config.read_timeout}s exceeded for {current_url}")
+            timeout = httpx.Timeout(
+                connect=min(5.0, remaining),
+                read=remaining,
+                write=min(5.0, remaining),
+                pool=min(5.0, remaining),
+            )
             headers = {
                 "User-Agent": _get_user_agent(),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
@@ -99,7 +118,7 @@ class WebReader:
             redirect_next: str | None = None
 
             try:
-                with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+                with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
                     with client.stream("GET", current_url, headers=headers) as resp:
                         # Redirect handling
                         if resp.status_code in (301, 302, 303, 307, 308):
@@ -135,19 +154,56 @@ class WebReader:
                                         raise FetchError(f"Content-Length {cl_int} exceeds limit {self.config.max_response_bytes} for {current_url}")
                                 except ValueError:
                                     pass
-                            # Stream body
+                            # Stream body with absolute deadline — next blocking read
+                            # is constrained by remaining time, not just inactivity.
                             buf = bytearray()
                             total = 0
-                            for chunk in resp.iter_bytes(chunk_size=8192):
-                                if not chunk:
-                                    continue
-                                total += len(chunk)
-                                if total > self.config.max_response_bytes:
-                                    raise FetchError(f"Response body exceeds limit {self.config.max_response_bytes} bytes for {current_url}")
-                                buf.extend(chunk)
+                            # Deadline-aware chunk iteration
+                            iterator = iter(resp.iter_bytes(chunk_size=8192))
+                            sentinel = object()
+                            _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                            _timed_out = False
+                            try:
+                                while True:
+                                    remaining_chunk = deadline - time.monotonic()
+                                    if remaining_chunk <= 0:
+                                        raise FetchError(
+                                            f"Overall read timeout {self.config.read_timeout}s exceeded while fetching {current_url}"
+                                        )
+                                    future = _executor.submit(next, iterator, sentinel)
+                                    try:
+                                        chunk = future.result(timeout=remaining_chunk)
+                                    except concurrent.futures.TimeoutError as e:
+                                        _timed_out = True
+                                        try:
+                                            resp.close()
+                                        except Exception:
+                                            pass
+                                        _executor.shutdown(wait=False, cancel_futures=True)
+                                        raise FetchError(
+                                            f"Overall read timeout {self.config.read_timeout}s exceeded while fetching {current_url}"
+                                        ) from e
+                                    if chunk is sentinel:
+                                        break
+                                    if not chunk:
+                                        continue
+                                    total += len(chunk)
+                                    if total > self.config.max_response_bytes:
+                                        raise FetchError(
+                                            f"Response body exceeds limit {self.config.max_response_bytes} bytes for {current_url}"
+                                        )
+                                    buf.extend(chunk)
+                                    if time.monotonic() > deadline:
+                                        raise FetchError(
+                                            f"Overall read timeout {self.config.read_timeout}s exceeded while fetching {current_url}"
+                                        )
+                            finally:
+                                if not _timed_out:
+                                    _executor.shutdown(wait=True)
                             body_bytes = bytes(buf)
                             final_url = current_url
                             final_content_type = ct_main or ct
+                            final_content_type_full = ct
                             # success - no redirect
                             redirect_next = None
             except (UnsupportedContentTypeError, UnsafeUrlError, FetchError):
@@ -172,12 +228,11 @@ class WebReader:
             raise FetchError(f"Too many redirects (> {_MAX_REDIRECTS}) starting from {url}")
 
         assert body_bytes is not None and final_url is not None
-        # Decode
+        # Decode — keep full Content-Type for charset, not the stripped MIME.
         encoding = "utf-8"
-        ct_for_charset = final_content_type or ""
+        ct_for_charset = final_content_type_full or ""
         if "charset=" in ct_for_charset.lower():
             try:
-                # find charset value
                 for part in ct_for_charset.split(";"):
                     if "charset=" in part.lower():
                         encoding = part.split("=", 1)[1].strip().strip('"').strip("'")
@@ -233,10 +288,12 @@ class WebReader:
                         extracted = fallback
                         engine = "trafilatura-fallback"
                     else:
-                        if len(text.strip()) < 100:
-                            raise ExtractionError(f"Extraction returned empty for {final_url}", hint="page may be JS-rendered or empty")
-                        extracted = text
-                        engine = "raw"
+                        # Both extractors failed — do not flood context with raw HTML.
+                        # For HTML/XML we fail; raw passthrough is only for non-HTML text.
+                        raise ExtractionError(
+                            f"Extraction returned empty for {final_url}",
+                            hint="page may be JS-rendered or empty",
+                        )
                 try:
                     from trafilatura import extract_metadata
 

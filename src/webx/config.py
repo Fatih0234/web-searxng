@@ -12,6 +12,8 @@ from dataclasses import dataclass
 
 import platformdirs
 
+from .errors import UsageError
+
 
 def _env_int(name: str, default: int) -> int:
     v = os.environ.get(name)
@@ -20,7 +22,7 @@ def _env_int(name: str, default: int) -> int:
     try:
         return int(v)
     except ValueError as e:
-        raise ValueError(f"Invalid integer for {name}: {v!r}") from e
+        raise UsageError(f"Invalid integer for {name}: {v!r}") from e
 
 
 def _env_float(name: str, default: float) -> float:
@@ -30,7 +32,7 @@ def _env_float(name: str, default: float) -> float:
     try:
         return float(v)
     except ValueError as e:
-        raise ValueError(f"Invalid float for {name}: {v!r}") from e
+        raise UsageError(f"Invalid float for {name}: {v!r}") from e
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -42,7 +44,7 @@ def _env_bool(name: str, default: bool) -> bool:
         return True
     if low in ("0", "false", "no", "off"):
         return False
-    raise ValueError(f"Invalid bool for {name}: {v!r}")
+    raise UsageError(f"Invalid bool for {name}: {v!r}")
 
 
 @dataclass(slots=True, frozen=True)
@@ -75,7 +77,7 @@ class WebXConfig:
 
 
 def get_config() -> WebXConfig:
-    """Resolve config from env + platformdirs. Raises ValueError on invalid env."""
+    """Resolve config from env + platformdirs. Raises UsageError (exit 2) on invalid env."""
     # DATA_DIR
     env_data = os.environ.get("WEBX_DATA_DIR")
     if env_data and env_data.strip():
@@ -100,15 +102,15 @@ def get_config() -> WebXConfig:
     # hard safety caps (per 05 limits)
     # Search/read timeout must be >0; startup >0; max_bytes at least 1K, at most 100 MiB
     if startup_timeout <= 0 or startup_timeout > 300:
-        raise ValueError(f"WEBX_STARTUP_TIMEOUT out of range: {startup_timeout}")
+        raise UsageError(f"WEBX_STARTUP_TIMEOUT out of range: {startup_timeout}")
     if search_timeout <= 0 or search_timeout > 120:
-        raise ValueError(f"WEBX_SEARCH_TIMEOUT out of range: {search_timeout}")
+        raise UsageError(f"WEBX_SEARCH_TIMEOUT out of range: {search_timeout}")
     if read_timeout <= 0 or read_timeout > 120:
-        raise ValueError(f"WEBX_READ_TIMEOUT out of range: {read_timeout}")
+        raise UsageError(f"WEBX_READ_TIMEOUT out of range: {read_timeout}")
     if max_response_bytes < 1024 or max_response_bytes > 100 * 1024 * 1024:
-        raise ValueError(f"WEBX_MAX_RESPONSE_BYTES out of range: {max_response_bytes}")
+        raise UsageError(f"WEBX_MAX_RESPONSE_BYTES out of range: {max_response_bytes}")
     if max_read_chars < 1000 or max_read_chars > 500000:
-        raise ValueError(f"WEBX_MAX_READ_CHARS out of range: {max_read_chars}")
+        raise UsageError(f"WEBX_MAX_READ_CHARS out of range: {max_read_chars}")
 
     return WebXConfig(
         runtime_dir=runtime_dir,
