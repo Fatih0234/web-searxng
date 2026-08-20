@@ -111,6 +111,20 @@ webx read URL [--max-chars N] [--json] [--links] [--no-tables] [--precision] [--
 
 `--verbose` (global) enables debug traces to `stderr` (e.g. `read ok: https://example.com/ text/html 114 chars engine=trafilatura 1.23s`). Secrets never printed.
 
+Engine/category examples (SearXNG aggregates 269 services; filter per query when upstream rate-limits hit):
+```bash
+webx search "python httpx" --engine wikipedia --engine github --pretty
+webx search "SearXNG" --category it --pretty
+webx search "SearXNG documentation" --time month --pretty
+```
+
+Reader extraction examples (`--links` preserves `[text](url)` markdown; `--precision`/`--recall` tune trafilatura):
+```bash
+webx read "https://en.wikipedia.org/wiki/Python_(programming_language)" --max-chars 2000 --links | head -n 40
+webx read "https://en.wikipedia.org/wiki/Python_(programming_language)" --max-chars 2000 | head -n 40
+webx read "https://api.github.com/zen" --json | jq  # application/json is returned raw (engine=raw), not trafilatura
+```
+
 ## Runtime & config
 
 Runtime dir via `platformdirs` (overridable with `WEBX_DATA_DIR`):
@@ -198,7 +212,7 @@ Tool descriptions state the trust boundary: returned page text is **untrusted ex
 |---|---|
 | `doctor` says docker unavailable | Install Docker/Compose; `webx read` still works |
 | Search 403 | `json` not enabled in `settings.yml` (check `search.formats`) |
-| SearXNG starts but searches 0 results / 5xx | Upstream engines rate-limited / CAPTCHAd your IP — not a WebX bug; try different query/category |
+| SearXNG starts but searches 0 results / 5xx | Upstream engines rate-limited / CAPTCHAd your IP — check `webx logs` for `suspended_time=180` / `Too many request` / `HTTP 403`. Not a WebX bug; try different query/category or pin engines: `webx search "…" --engine wikipedia --engine github` (`google cse` is often the only engine not rate-limited from this IP) |
 | Reader returns tiny text | JS-rendered page — try `--recall` or different source; browser rendering is out of scope for v1 |
 | Reader rejects URL | Private/local network denial — intentional |
 | `webx logs` empty | `SearXNG not running` — `webx logs` now hints `run webx up or webx search to start` instead of silent empty |
@@ -229,6 +243,8 @@ webx read "file:///etc/passwd"          # -> exit 5
 webx stop; webx status                 # stopped
 # MCP: inspector 2 tools, web_read while stopped, first search starts, second reuses, stop-on-exit ownership
 ```
+
+> **Note on `httpbin.org`:** Live `httpbin.org` currently returns `503 Service Temporarily Unavailable` from some networks (verified 2026-08-20 via `curl -A "webx/0.1.0"` and `curl -A "Mozilla/5.0"` both 503). If `webx read https://httpbin.org/html` 503s, use stable alternatives: `https://example.com`, `https://en.wikipedia.org/wiki/Python_(programming_language)` (good for truncation/`--links` tests), or `https://httpbingo.org/get`.
 
 ## Project layout
 

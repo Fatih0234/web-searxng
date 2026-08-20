@@ -6,6 +6,8 @@ import pytest
 from webx.config import WebXConfig
 from webx.errors import FetchError, UnsupportedContentTypeError, UnsafeUrlError, ExtractionError
 
+# Tests use mocked http://example.com — live httpbin.org is flaky (503 from some nets, verified 2026-08-20) — see README for stable alternatives.
+
 def make_cfg(**overrides):
     base = dict(
         runtime_dir=pathlib.Path("/tmp/webx-reader"),
@@ -250,3 +252,100 @@ def test_extraction_fallback(monkeypatch):
     resp = reader.read("http://example.com/fallback.html")
     assert "Fallback" in resp.content
     assert resp.engine == "trafilatura-fallback"
+
+
+def test_json_raw_not_trafilatura(monkeypatch):
+    """application/json must be returned raw (engine=raw) not via trafilatura, with charset honored."""
+    cfg = make_cfg()
+    monkeypatch.setattr(socket, "getaddrinfo", fake_public_getaddrinfo)
+    from webx.reader import WebReader
+
+    # utf-8 json
+    body_utf8 = '{"key": "café", "num": 42}'.encode("utf-8")
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-type": "application/json; charset=utf-8"}
+    mock_resp.iter_bytes.return_value = [body_utf8]
+    ms = mock.MagicMock()
+    ms.__enter__.return_value = mock_resp
+    ms.__exit__.return_value = False
+    mock_client = mock.MagicMock()
+    mock_client.stream.return_value = ms
+    mock_client.__enter__.return_value = mock_client
+    mock_client.__exit__.return_value = False
+    monkeypatch.setattr("webx.reader.httpx.Client", lambda *a, **kw: mock_client)
+    reader = WebReader(cfg)
+    resp = reader.read("http://example.com/data.json")
+    assert resp.content == '{"key": "café", "num": 42}'
+    assert resp.engine == "raw"
+    assert resp.content_type == "application/json"
+    assert resp.truncated is False
+
+    # iso-8859-1 json (charset honoring)
+    body_latin1 = '{"key": "café"}'.encode("iso-8859-1")
+    mock_resp2 = mock.MagicMock()
+    mock_resp2.status_code = 200
+    mock_resp2.headers = {"content-type": "application/json; charset=iso-8859-1"}
+    mock_resp2.iter_bytes.return_value = [body_latin1]
+    ms2 = mock.MagicMock()
+    ms2.__enter__.return_value = mock_resp2
+    ms2.__exit__.return_value = False
+    mock_client2 = mock.MagicMock()
+    mock_client2.stream.return_value = ms2
+    mock_client2.__enter__.return_value = mock_client2
+    mock_client2.__exit__.return_value = False
+    monkeypatch.setattr("webx.reader.httpx.Client", lambda *a, **kw: mock_client2)
+    resp2 = reader.read("http://example.com/data2.json")
+    assert "café" in resp2.content
+    assert resp2.engine == "raw"
+
+
+def test_extract_flags_propagate(monkeypatch):
+    """include_links/include_tables/precision/recall must reach trafilatura.extract."""
+    cfg = make_cfg()
+    monkeypatch.setattr(socket, "getaddrinfo", fake_public_getaddrinfo)
+    from webx.reader import WebReader
+
+    html = b"<html><body><article><p>Content with <a href='https://example.com'>link</a> and table.</p></article></body></html>"
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-type": "text/html"}
+    mock_resp.iter_bytes.return_value = [html]
+    ms = mock.MagicMock()
+    ms.__enter__.return_value = mock_resp
+    ms.__exit__.return_value = False
+    mock_client = mock.MagicMock()
+    mock_client.stream.return_value = ms
+    mock_client.__enter__.return_value = mock_client
+    mock_client.__exit__.return_value = False
+    monkeypatch.setattr("webx.reader.httpx.Client", lambda *a, **kw: mock_client)
+
+    import trafilatura
+
+    captured = {}
+
+    def fake_extract(text, url=None, output_format=None, include_comments=None, include_tables=None, include_links=None, with_metadata=None, favor_precision=None, favor_recall=None, **kw):
+        captured["include_links"] = include_links
+        captured["include_tables"] = include_tables
+        captured["favor_precision"] = favor_precision
+        captured["favor_recall"] = favor_recall
+        return "extracted with flags"
+
+    monkeypatch.setattr(trafilatura, "extract", fake_extract)
+    monkeypatch.setattr("trafilatura.extract_metadata", lambda *a, **kw: None, raising=False)
+
+    reader = WebReader(cfg)
+    resp = reader.read("http://example.com/flags.html", include_links=True, include_tables=False, precision=True, recall=False)
+    assert captured["include_links"] is True
+    assert captured["include_tables"] is False
+    assert captured["favor_precision"] is True
+    assert captured["favor_recall"] is False
+    assert "extracted" in resp.content
+
+    # second call with opposite flags
+    captured.clear()
+    resp2 = reader.read("http://example.com/flags2.html", include_links=False, include_tables=True, precision=False, recall=True)
+    assert captured["include_links"] is False
+    assert captured["include_tables"] is True
+    assert captured["favor_precision"] is False
+    assert captured["favor_recall"] is True
