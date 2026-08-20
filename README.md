@@ -96,18 +96,18 @@ Tool list must be exactly `web_search` + `web_read`.  Lifecycle is internal — 
 webx --help
 webx --version
 webx init [--force-templates] [--show-path]   # idempotent, never rotates secret
-webx doctor                                   # inspection only
+webx doctor [--json]                          # inspection only (now reports searxng_image/version)
 webx up                                       # ensure SearXNG running
 webx stop                                     # compose stop (normal shutdown)
-webx status [--json]
+webx status [--json]                          # now includes searxng_image/version
 webx logs [--tail 100]
 webx search QUERY [--limit 8] [--category general] [--language en] [--page 1]
               [--time {day,month,year}] [--safe-search {0,1,2}] [--engine NAME] [--pretty]
-webx read URL [--max-chars N] [--json] [--links] [--no-tables] [--precision] [--recall]
+webx read URL [--max-chars N] [--json] [--links] [--no-tables] [--precision] [--recall] [--no-cache]
 ```
 
 * `stdout` = data (JSON for search, Markdown/text or JSON for read).  `stderr` = diagnostics.
-* Exit codes: `0` ok, `2` usage/validation, `3` runtime/docker unavailable, `4` SearXNG failure, `5` unsafe URL, `6` fetch/extraction failure, `7` unsupported content type (`2xx` with `image/*`, `application/pdf`, etc.). `4xx`/`5xx`/timeout from a public URL is `6`, not `7` (e.g. `wikimedia PNG -> HTTP 400` -> `6`).
+* Exit codes: `0` ok, `2` usage/validation, `3` runtime/docker unavailable, `4` SearXNG failure, `5` unsafe URL, `6` fetch/extraction failure, `7` unsupported content type (`2xx` with `image/*` etc.; `application/pdf` needs `uv sync --extra pdf` else `7` with hint, `2xx` image/pdf without pdf extra → `7`). `4xx`/`5xx`/timeout from a public URL is `6`, not `7` (e.g. `wikimedia PNG -> HTTP 400` -> `6`).
 
 `--verbose` (global) enables debug traces to `stderr` (e.g. `read ok: https://example.com/ text/html 114 chars engine=trafilatura 1.23s`). Secrets never printed.
 
@@ -137,12 +137,12 @@ Contains `compose.yml`, `settings.yml`, `.env` (`SEARXNG_SECRET` 0600), `cache/`
 
 `settings.yml` is a tiny override (`use_default_settings: true`, `formats: [html, json]`, `limiter: false`, `public_instance: false`, `image_proxy: false`).  Do not copy the whole SearXNG default config.
 
-`compose.yml`:
+`compose.yml` (pinned, `latest` no longer used):
 
 ```yaml
 services:
   searxng:
-    image: ${SEARXNG_IMAGE:-docker.io/searxng/searxng:latest}
+    image: ${SEARXNG_IMAGE:-docker.io/searxng/searxng:2026.8.19-5ffd32ca2}
     container_name: webx-searxng
     ports: ["127.0.0.1:8888:8080"]
     env_file: [.env]
@@ -164,11 +164,22 @@ WEBX_MAX_RESPONSE_BYTES (10 MiB), WEBX_MAX_READ_CHARS (40000), WEBX_MCP_STOP_ON_
 
 ## SearXNG image version
 
-Verified at implementation (2026-08-20):
+Pinned at implementation (2026-08-20) — `v1.2` (`0f5e582`):
 
-- Tag: `docker.io/searxng/searxng:latest`
-- Resolved digest: `sha256:ec536bcd1e83577aad4cc07f7ecb9a30858a9a905d2d57c8796abc83f872a036` (local image `ec536bcd1e83`, SearXNG `2026.8.1-8892414dc`)
-- Configurable via `SEARXNG_IMAGE` — do not auto-pull on each search.
+- Tag: `docker.io/searxng/searxng:2026.8.19-5ffd32ca2` (was `latest`)
+- Running version via `webx doctor --json` / `webx status --json`: `searxng_version: 2026.8.1+8892414dc` (from `/config` when reachable) or image tag when stopped
+- Override: `SEARXNG_IMAGE=docker.io/searxng/searxng:2026.8.17-374939b88 webx up` or `SEARXNG_IMAGE=...` in `.env` — then `webx init --force-templates` to materialize
+- `latest` is intentionally not used for reproducibility; see `https://docs.searxng.org/admin/api.html` (`/config`) for engine suspension diagnostics
+- Current `settings.yml` still `use_default_settings: true` — no Valkey, limiter off for loopback
+
+`webx doctor --json` example:
+```json
+{
+  "searxng_image": "docker.io/searxng/searxng:2026.8.19-5ffd32ca2",
+  "searxng_version": "2026.8.1+8892414dc",
+  "searxng_reachable": true
+}
+```
 
 Manual update:
 
@@ -197,11 +208,11 @@ Tool descriptions state the trust boundary: returned page text is **untrusted ex
 
 - Allow only `http://` / `https://`; deny `file:`, `ftp:`, `data:`, `javascript:`, bare paths, credential-bearing URLs.
 - Resolve hostname via OS resolver, inspect **every** IPv4/IPv6 with `ipaddress`: deny loopback, RFC1918 private, IPv6 ULA, link-local (`169.254.0.0/16`, `fe80::/10`), multicast, unspecified, reserved, metadata `169.254.169.254`, and the SearXNG endpoint itself.  No `--allow-private` in v1.
-- **DNS rebinding residual:** resolve-then-connect cannot perfectly prevent rebinding because `httpx` may resolve again; WebX validates every redirect target and documents the limitation.  Address pinning is a possible hardening without bloating v1.
+- **DNS pinning (v1.2):** `http`+`https` resolve once via `resolve_and_check`, validate all IPs, then pin transport to those IPs (`Host` header + `sni_hostname` for TLS, try each IP on `ConnectError`, fail-closed, no fallback to unpinned URL). Validates every redirect target; `127.0.0.1:8888` SearXNG endpoint also denied.
 - Redirects: manual loop, max 5, `Location` resolved against current URL, re-validated, loop/excess fails.
 - Fetch: `User-Agent: webx/<version> local-research-tool`, connect 5s, read 15s, streamed with `Content-Length` pre-check + 10 MiB cap, no browser masquerade.
-- Allowed types: `text/html`, `application/xhtml+xml`, `text/plain`, markdown-like, `json`/`xml` text; binary (`image/*`, `application/pdf`, etc.) → exit 7.
-- Extraction: raw body → `trafilatura.extract(output_format="markdown", ...)` + `html2txt` fallback; truncate **after** extraction at a word/Newline boundary, report `truncated` + `characters`.
+- Allowed types: `text/html`, `application/xhtml+xml`, `text/plain`, markdown-like, `json`/`xml` text; `application/pdf` via `pypdf` (`--extra pdf`, first 20 pages, `engine=pypdf`, `pages_total/pages_read/partial`); binary `image/*` etc. → exit 7.
+- Extraction: raw body → `trafilatura.extract(output_format="markdown", ...)` + `html2txt` fallback; PDF via `pypdf` in isolated subprocess (10s timeout); truncate **after** extraction at a word/Newline boundary, report `truncated` + `characters` + `engine`/`pages_total`/`partial` in `--json`.
 - No cookies, auth headers, POST, or browser.
 
 ## Operations & troubleshooting
@@ -258,9 +269,9 @@ docs/{instructions,PLAN.md}
 
 Core `WebX` facade is shared by CLI and MCP; neither shells out to the other.
 
-## Non-goals (v1)
+## Non-goals (v1.2)
 
-Browser/Playwright, PDF reader, crawling, reranker, LLM summarizer, cache, inter-process lease, engine presets, domain filters — see `09_DECISIONS_AND_FUTURE.md` for rationale and v2 candidates.
+Browser/Playwright (explicit `web_read_rendered` deferred — bench 81% useful, ~300MB Chromium not justified), crawling, reranker, LLM summarizer, inter-process lease, engine presets, domain filters — see `09_DECISIONS_AND_FUTURE.md` for rationale and P3 harnesses (`scripts/bench_*.py` 50/60 corpora). `v1.2` added: pinned SearXNG, SNI pinning, PDF `pypdf` subprocess, `engine` provenance, `--no-cache` in-memory LRU, MCP/Pi unified contract.
 
 ## License
 
