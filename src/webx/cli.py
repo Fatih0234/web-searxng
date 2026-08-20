@@ -28,7 +28,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--show-path", action="store_true", help="print runtime path")
 
     # doctor
-    sub.add_parser("doctor", help="check runtime, docker, SearXNG reachability")
+    sp = sub.add_parser("doctor", help="check runtime, docker, SearXNG reachability")
+    sp.add_argument("--json", action="store_true", dest="json_output", help="JSON output")
 
     # up
     sub.add_parser("up", help="ensure SearXNG is running")
@@ -117,8 +118,10 @@ def _dispatch(args: argparse.Namespace, verbose: bool) -> int:
 
         cfg = get_config()
         report = doctor(cfg)
-        # human readable to stderr? but we keep simple: JSON if verbose? spec says doctor is inspection, human readable.
-        # Print human summary to stdout
+        if getattr(args, "json_output", False):
+            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+            return 0
+        # human readable
         print(f"webx {__version__}")
         print(f"runtime: {report.runtime_dir} ({'initialized' if report.initialized else 'not initialized'})")
         print(f"docker: {'available' if report.docker_available else 'unavailable'}" + (f" ({report.compose_version})" if report.compose_version else ""))
@@ -126,6 +129,10 @@ def _dispatch(args: argparse.Namespace, verbose: bool) -> int:
             print(f"docker error: {report.docker_error}", file=sys.stderr)
         print(f"templates: {'present' if report.templates_present else 'missing'}")
         print(f"SearXNG url: {report.searxng_url} reachable={report.searxng_reachable}")
+        if report.searxng_image:
+            print(f"SearXNG image: {report.searxng_image}")
+        if report.searxng_version:
+            print(f"SearXNG version: {report.searxng_version}")
         print(f"trafilatura: {report.trafilatura_version or 'missing'}")
         print(f"mcp: {report.mcp_version or ('not installed' if not report.mcp_available else 'available')}")
         for note in report.notes:
@@ -154,12 +161,16 @@ def _dispatch(args: argparse.Namespace, verbose: bool) -> int:
         cfg = get_config()
         st = get_status(cfg)
         if args.json_output:
-            print(json.dumps(st.to_dict()))
+            print(json.dumps(st.to_dict(), ensure_ascii=False))
         else:
             print(f"initialized: {st.initialized}")
             print(f"compose: {'present' if st.compose_exists else 'missing'}")
             print(f"docker: {'available' if st.docker_available else 'unavailable'}")
             print(f"SearXNG running: {st.searxng_running}")
+            if st.searxng_image:
+                print(f"SearXNG image: {st.searxng_image}")
+            if st.searxng_version:
+                print(f"SearXNG version: {st.searxng_version}")
             print(f"url: {st.url}")
             print(f"runtime: {st.runtime_dir}")
             # Hint when global container from other WEBX_DATA_DIR is running but local compose missing

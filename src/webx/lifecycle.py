@@ -130,6 +130,72 @@ def _compose_version(cfg: WebXConfig) -> str | None:
         return None
 
 
+def _searxng_image(cfg: WebXConfig) -> str | None:
+    """Return the SearXNG image that will be used (from compose or env override)."""
+    # Env override takes precedence
+    import os
+
+    env = os.environ.get("SEARXNG_IMAGE")
+    if env:
+        return env
+    # Parse compose file for default
+    try:
+        if cfg.compose_file.exists():
+            txt = cfg.compose_file.read_text(encoding="utf-8")
+            for line in txt.splitlines():
+                if "image:" in line and "searxng" in line:
+                    # e.g. "    image: ${SEARXNG_IMAGE:-docker.io/searxng/searxng:2026.8.19-5ffd32ca2}"
+                    # Extract default after :-
+                    if ":-" in line:
+                        start = line.index(":-") + 2
+                        end = line.index("}", start)
+                        return line[start:end].strip()
+                    # Fallback: raw after "image:"
+                    return line.split("image:", 1)[1].strip().strip('"').strip("'")
+        # Fallback to asset
+        txt = _asset_text("compose.yml")
+        for line in txt.splitlines():
+            if "image:" in line and "searxng" in line and ":-" in line:
+                start = line.index(":-") + 2
+                end = line.index("}", start)
+                return line[start:end].strip()
+    except Exception:
+        pass
+    return None
+
+
+def _searxng_version(cfg: WebXConfig) -> str | None:
+    """Try to get SearXNG version via /config or via image tag."""
+    # Try /config admin API if reachable
+    try:
+        import httpx as _httpx
+
+        url = cfg.searxng_url.rstrip("/") + "/config"
+        with _httpx.Client(timeout=2.0, follow_redirects=False, trust_env=False) as c:
+            r = c.get(url)
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                    # SearXNG /config may contain version fields
+                    for key in ("version", "searxng_version", "searxng", "instance_name"):
+                        if isinstance(j, dict) and key in j and isinstance(j[key], str):
+                            return j[key]
+                    # Sometimes engines dict indicates version indirectly; return image tag instead
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # Fallback: derive version from image tag
+    img = _searxng_image(cfg)
+    if img and ":" in img:
+        tag = img.rsplit(":", 1)[-1]
+        # strip digest if present
+        if "@" in tag:
+            tag = tag.split("@")[0]
+        return tag
+    return None
+
+
 def status(cfg: WebXConfig) -> RuntimeStatus:
     compose_exists = cfg.compose_file.exists()
     initialized = compose_exists and cfg.settings_file.exists()
@@ -139,6 +205,17 @@ def status(cfg: WebXConfig) -> RuntimeStatus:
         running = _probe(cfg.searxng_url, timeout=2.0)
     except Exception:
         running = False
+    img = _searxng_image(cfg)
+    ver: str | None = None
+    if img and ":" in img:
+        ver = img.rsplit(":", 1)[-1].split("@")[0]
+    if running:
+        try:
+            cfg_ver = _searxng_version(cfg)
+            if cfg_ver:
+                ver = cfg_ver
+        except Exception:
+            pass
     return RuntimeStatus(
         initialized=initialized,
         docker_available=docker_av,
@@ -146,6 +223,8 @@ def status(cfg: WebXConfig) -> RuntimeStatus:
         url=cfg.searxng_url,
         runtime_dir=str(cfg.runtime_dir),
         compose_exists=compose_exists,
+        searxng_image=img,
+        searxng_version=ver,
     )
 
 
@@ -198,6 +277,33 @@ def doctor(cfg: WebXConfig) -> DoctorReport:
         notes.append("run `webx init` to materialize runtime templates")
     if not reachable and initialized:
         notes.append("SearXNG not reachable — will be lazy-started on next search")
+    # SearXNG image/version observability
+    searxng_img = _searxng_image(cfg)
+    searxng_ver: str | None = None
+    if reachable:
+        try:
+            searxng_ver = _searxng_version(cfg)
+        except Exception:
+            searxng_ver = None
+    else:
+        # Not running: version is image tag
+        if searxng_img and ":" in searxng_img:
+            tag = searxng_img.rsplit(":", 1)[-1]
+            searxng_ver = tag.split("@")[0] if "@" in tag else tag
+    if searxng_img and "latest" in searxng_img:
+        notes.append("SearXNG image is :latest — pin to a versioned tag for reproducibility (SEARXNG_IMAGE env)")
+    # Check for engine suspension hint via /search?format=json quick probe (optional, non-fatal)
+    if reachable:
+        try:
+            import httpx as _httpx2
+
+            with _httpx2.Client(timeout=2.0, trust_env=False) as c:
+                r = c.get(cfg.searxng_url.rstrip("/") + "/config", follow_redirects=False)
+                # If /config is accessible, it helps distinguish WebX vs upstream failures
+                if r.status_code == 200:
+                    notes.append("SearXNG /config accessible — use for engine suspension diagnostics (see https://docs.searxng.org/admin/api.html)")
+        except Exception:
+            pass
 
     return DoctorReport(
         python_version=platform.python_version(),
@@ -215,6 +321,8 @@ def doctor(cfg: WebXConfig) -> DoctorReport:
         mcp_version=mcp_ver,
         docker_error=docker_err,
         notes=notes,
+        searxng_image=searxng_img,
+        searxng_version=searxng_ver,
     )
 
 

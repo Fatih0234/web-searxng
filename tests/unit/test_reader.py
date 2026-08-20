@@ -164,7 +164,7 @@ def test_redirect_cap(monkeypatch):
     call_count = {"n": 0}
     def fake_client(*a, **kw):
         mock_c = mock.MagicMock()
-        def fake_stream(method, url, headers=None):
+        def fake_stream(method, url, headers=None, extensions=None, **kw2):
             ms = mock.MagicMock()
             # For first 6 calls, return redirect; after that not reached
             ms.__enter__.return_value = make_redirect_resp(f"http://example.com/redirect{call_count['n']+1}")

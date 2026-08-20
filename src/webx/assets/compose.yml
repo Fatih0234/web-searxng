@@ -1,6 +1,6 @@
 services:
   searxng:
-    image: ${SEARXNG_IMAGE:-docker.io/searxng/searxng:latest}
+    image: ${SEARXNG_IMAGE:-docker.io/searxng/searxng:2026.8.19-5ffd32ca2}
     container_name: webx-searxng
     ports:
       - "127.0.0.1:8888:8080"

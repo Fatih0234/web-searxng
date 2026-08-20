@@ -80,6 +80,27 @@ def _cache_key(url: str, max_chars: int, include_links: bool, include_tables: bo
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def _pdf_extract_worker(args: tuple[bytes, int]) -> tuple[str, int, int]:
+    """Worker for PDF extraction in isolated process — must be top-level for pickling."""
+    data, max_chars = args
+    import pypdf  # type: ignore
+
+    reader = pypdf.PdfReader(io.BytesIO(data))
+    pages_total = len(reader.pages)
+    pages_read = min(pages_total, 20)
+    texts: list[str] = []
+    for page in reader.pages[:20]:
+        try:
+            t = page.extract_text() or ""
+            texts.append(t)
+            if sum(len(x) for x in texts) > max_chars + 5000:
+                break
+        except Exception:
+            continue
+    extracted = "\n\n".join(texts).strip()
+    return extracted, pages_total, pages_read
+
+
 class WebReader:
     def __init__(self, config: WebXConfig) -> None:
         self.config = config
@@ -124,35 +145,46 @@ class WebReader:
             # Validate every hop
             validate_url(current_url, self.config)
 
-            # DNS pinning for http (mitigate rebinding TOCTOU). For https, SNI makes IP pinning complex,
-            # so we keep double-resolve + redirect re-validation. For http, replace host with pinned IP.
-            pinned_url = current_url
-            pin_headers: dict[str, str] = {}
+            # DNS pinning — resolve once, pin to validated IPs (fail-closed, http+https).
+            # For https, preserve SNI via extensions={"sni_hostname": original_host}.
             _parsed_pin = urllib.parse.urlparse(current_url)
-            if _parsed_pin.scheme.lower() == "http" and _parsed_pin.hostname:
+            _scheme = _parsed_pin.scheme.lower()
+            _hostname = _parsed_pin.hostname
+            _is_literal = False
+            if _hostname:
                 try:
-                    import ipaddress as _ipaddr_pin
+                    import ipaddress as _ipaddr_pin  # noqa: F401
 
+                    _ipaddr_pin.ip_address(_hostname.strip("[]"))
                     _is_literal = True
-                    try:
-                        _ipaddr_pin.ip_address(_parsed_pin.hostname.strip("[]"))
-                    except ValueError:
-                        _is_literal = False
-                    if not _is_literal:
-                        _ips = resolve_and_check(_parsed_pin.hostname)
-                        _ip = _ips[0]
-                        _host = f"[{_ip}]" if ":" in _ip and not _ip.startswith("[") else _ip
-                        _port = f":{_parsed_pin.port}" if _parsed_pin.port else ""
-                        _path = _parsed_pin.path or "/"
-                        _query = f"?{_parsed_pin.query}" if _parsed_pin.query else ""
-                        _frag = f"#{_parsed_pin.fragment}" if _parsed_pin.fragment else ""
-                        pinned_url = f"http://{_host}{_port}{_path}{_query}{_frag}"
-                        pin_headers["Host"] = _parsed_pin.hostname if not _parsed_pin.port else f"{_parsed_pin.hostname}:{_parsed_pin.port}"
+                except ValueError:
+                    _is_literal = False
+                except Exception:
+                    _is_literal = False
+            _pinned_ips: list[str] | None = None
+            if _hostname and not _is_literal and _scheme in ("http", "https"):
+                # Fail-closed: any deny → UnsafeUrlError; any other pinning error → FetchError (no fallback)
+                try:
+                    _pinned_ips = resolve_and_check(_hostname)
                 except UnsafeUrlError:
                     raise
-                except Exception:
-                    pinned_url = current_url
-                    pin_headers = {}
+                except Exception as e:
+                    raise FetchError(f"DNS pinning failed for {_hostname}: {e}") from e
+            # Build candidates — one per validated IP, try each on ConnectError
+            _candidates: list[tuple[str, dict[str, str], dict | None]] = []
+            if _pinned_ips is None:
+                _candidates = [(current_url, {}, None)]
+            else:
+                for _ip in _pinned_ips:
+                    _host = f"[{_ip}]" if ":" in _ip and not _ip.startswith("[") else _ip
+                    _port = f":{_parsed_pin.port}" if _parsed_pin.port else ""
+                    _path = _parsed_pin.path or "/"
+                    _query = f"?{_parsed_pin.query}" if _parsed_pin.query else ""
+                    _frag = f"#{_parsed_pin.fragment}" if _parsed_pin.fragment else ""
+                    _pinned_url = f"{_scheme}://{_host}{_port}{_path}{_query}{_frag}"
+                    _pin_headers = {"Host": _hostname if not _parsed_pin.port else f"{_hostname}:{_parsed_pin.port}"}
+                    _pin_ext = {"sni_hostname": _hostname} if _scheme == "https" else None
+                    _candidates.append((_pinned_url, _pin_headers, _pin_ext))
 
             # Remaining time bounds all network waits for this hop
             remaining = deadline - time.monotonic()
@@ -164,109 +196,124 @@ class WebReader:
                 write=min(5.0, remaining),
                 pool=min(5.0, remaining),
             )
-            headers = {
+            base_headers = {
                 "User-Agent": _get_user_agent(),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
             }
-            headers.update(pin_headers)
 
             redirect_next: str | None = None
-
-            try:
-                with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
-                    with client.stream("GET", pinned_url, headers=headers) as resp:
-                        # Redirect handling
-                        if resp.status_code in (301, 302, 303, 307, 308):
-                            location = resp.headers.get("location")
-                            if not location:
-                                raise FetchError(f"Redirect {resp.status_code} without Location from {current_url}")
-                            next_url = urllib.parse.urljoin(current_url, location)
-                            if next_url in visited or next_url == current_url:
-                                raise FetchError(f"Redirect loop detected: {current_url} -> {next_url}")
-                            if len(visited) >= _MAX_REDIRECTS:
-                                raise FetchError(f"Too many redirects (> {_MAX_REDIRECTS}) starting from {url}")
-                            try:
-                                validate_url(next_url, self.config)
-                            except UnsafeUrlError as e:
-                                raise UnsafeUrlError(f"Redirect target disallowed: {next_url!r} from {current_url!r}: {e}") from e
-                            redirect_next = next_url
-                        else:
-                            if resp.status_code < 200 or resp.status_code >= 400:
-                                raise FetchError(f"HTTP {resp.status_code} fetching {current_url}")
-                            ct = resp.headers.get("content-type", "")
-                            ct_main = ct.split(";")[0].strip().lower() if ct else ""
-                            if not _is_allowed_content_type(ct_main):
-                                raise UnsupportedContentTypeError(
-                                    f"Unsupported content type: {ct_main or 'unknown'} for {current_url}",
-                                    hint="binary types like PDF/image are not supported in v1",
-                                )
-                            # Content-Length pre-check
-                            cl = resp.headers.get("content-length")
-                            if cl is not None:
+            _last_connect_error: Exception | None = None
+            _hop_success = False
+            for _cand_idx, (_pinned_url, _pin_headers, _pin_ext) in enumerate(_candidates):
+                headers = {**base_headers, **_pin_headers}
+                try:
+                    with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
+                        with client.stream("GET", _pinned_url, headers=headers, extensions=_pin_ext) as resp:
+                            # Redirect handling
+                            if resp.status_code in (301, 302, 303, 307, 308):
+                                location = resp.headers.get("location")
+                                if not location:
+                                    raise FetchError(f"Redirect {resp.status_code} without Location from {current_url}")
+                                next_url = urllib.parse.urljoin(current_url, location)
+                                if next_url in visited or next_url == current_url:
+                                    raise FetchError(f"Redirect loop detected: {current_url} -> {next_url}")
+                                if len(visited) >= _MAX_REDIRECTS:
+                                    raise FetchError(f"Too many redirects (> {_MAX_REDIRECTS}) starting from {url}")
                                 try:
-                                    cl_int = int(cl)
-                                    if cl_int > self.config.max_response_bytes:
-                                        raise FetchError(f"Content-Length {cl_int} exceeds limit {self.config.max_response_bytes} for {current_url}")
-                                except ValueError:
-                                    pass
-                            # Stream body with absolute deadline — next blocking read
-                            # is constrained by remaining time, not just inactivity.
-                            buf = bytearray()
-                            total = 0
-                            # Deadline-aware chunk iteration
-                            iterator = iter(resp.iter_bytes(chunk_size=8192))
-                            sentinel = object()
-                            _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                            _timed_out = False
-                            try:
-                                while True:
-                                    remaining_chunk = deadline - time.monotonic()
-                                    if remaining_chunk <= 0:
-                                        raise FetchError(
-                                            f"Overall read timeout {self.config.read_timeout}s exceeded while fetching {current_url}"
-                                        )
-                                    future = _executor.submit(next, iterator, sentinel)
+                                    validate_url(next_url, self.config)
+                                except UnsafeUrlError as e:
+                                    raise UnsafeUrlError(f"Redirect target disallowed: {next_url!r} from {current_url!r}: {e}") from e
+                                redirect_next = next_url
+                            else:
+                                if resp.status_code < 200 or resp.status_code >= 400:
+                                    raise FetchError(f"HTTP {resp.status_code} fetching {current_url}")
+                                ct = resp.headers.get("content-type", "")
+                                ct_main = ct.split(";")[0].strip().lower() if ct else ""
+                                if not _is_allowed_content_type(ct_main):
+                                    raise UnsupportedContentTypeError(
+                                        f"Unsupported content type: {ct_main or 'unknown'} for {current_url}",
+                                        hint="binary types like PDF/image are not supported in v1",
+                                    )
+                                # Content-Length pre-check
+                                cl = resp.headers.get("content-length")
+                                if cl is not None:
                                     try:
-                                        chunk = future.result(timeout=remaining_chunk)
-                                    except concurrent.futures.TimeoutError as e:
-                                        _timed_out = True
+                                        cl_int = int(cl)
+                                        if cl_int > self.config.max_response_bytes:
+                                            raise FetchError(f"Content-Length {cl_int} exceeds limit {self.config.max_response_bytes} for {current_url}")
+                                    except ValueError:
+                                        pass
+                                # Stream body with absolute deadline — next blocking read
+                                # is constrained by remaining time, not just inactivity.
+                                buf = bytearray()
+                                total = 0
+                                # Deadline-aware chunk iteration
+                                iterator = iter(resp.iter_bytes(chunk_size=8192))
+                                sentinel = object()
+                                _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                                _timed_out = False
+                                try:
+                                    while True:
+                                        remaining_chunk = deadline - time.monotonic()
+                                        if remaining_chunk <= 0:
+                                            raise FetchError(
+                                                f"Overall read timeout {self.config.read_timeout}s exceeded while fetching {current_url}"
+                                            )
+                                        future = _executor.submit(next, iterator, sentinel)
                                         try:
-                                            resp.close()
-                                        except Exception:
-                                            pass
-                                        _executor.shutdown(wait=False, cancel_futures=True)
-                                        raise FetchError(
-                                            f"Overall read timeout {self.config.read_timeout}s exceeded while fetching {current_url}"
-                                        ) from e
-                                    if chunk is sentinel:
-                                        break
-                                    if not chunk:
-                                        continue
-                                    total += len(chunk)
-                                    if total > self.config.max_response_bytes:
-                                        raise FetchError(
-                                            f"Response body exceeds limit {self.config.max_response_bytes} bytes for {current_url}"
-                                        )
-                                    buf.extend(chunk)
-                                    if time.monotonic() > deadline:
-                                        raise FetchError(
-                                            f"Overall read timeout {self.config.read_timeout}s exceeded while fetching {current_url}"
-                                        )
-                            finally:
-                                if not _timed_out:
-                                    _executor.shutdown(wait=True)
-                            body_bytes = bytes(buf)
-                            final_url = current_url
-                            final_content_type = ct_main or ct
-                            final_content_type_full = ct
-                            # success - no redirect
-                            redirect_next = None
-            except (UnsupportedContentTypeError, UnsafeUrlError, FetchError):
-                raise
-            except httpx.TimeoutException as e:
-                raise FetchError(f"Timeout fetching {current_url}: {e}") from e
-            except httpx.RequestError as e:
-                raise FetchError(f"Request failed fetching {current_url}: {e}") from e
+                                            chunk = future.result(timeout=remaining_chunk)
+                                        except concurrent.futures.TimeoutError as e:
+                                            _timed_out = True
+                                            try:
+                                                resp.close()
+                                            except Exception:
+                                                pass
+                                            _executor.shutdown(wait=False, cancel_futures=True)
+                                            raise FetchError(
+                                                f"Overall read timeout {self.config.read_timeout}s exceeded while fetching {current_url}"
+                                            ) from e
+                                        if chunk is sentinel:
+                                            break
+                                        if not chunk:
+                                            continue
+                                        total += len(chunk)
+                                        if total > self.config.max_response_bytes:
+                                            raise FetchError(
+                                                f"Response body exceeds limit {self.config.max_response_bytes} bytes for {current_url}"
+                                            )
+                                        buf.extend(chunk)
+                                        if time.monotonic() > deadline:
+                                            raise FetchError(
+                                                f"Overall read timeout {self.config.read_timeout}s exceeded while fetching {current_url}"
+                                            )
+                                finally:
+                                    if not _timed_out:
+                                        _executor.shutdown(wait=True)
+                                body_bytes = bytes(buf)
+                                final_url = current_url
+                                final_content_type = ct_main or ct
+                                final_content_type_full = ct
+                                # success - no redirect
+                                redirect_next = None
+                except (UnsupportedContentTypeError, UnsafeUrlError, FetchError):
+                    raise
+                except (httpx.ConnectError, httpx.ConnectTimeout) as e:  # type: ignore[attr-defined]
+                    _last_connect_error = e
+                    if _cand_idx < len(_candidates) - 1:
+                        continue
+                    raise FetchError(f"Connection failed for {current_url} (tried {len(_candidates)} pinned IPs): {e}") from e
+                except httpx.TimeoutException as e:
+                    raise FetchError(f"Timeout fetching {current_url}: {e}") from e
+                except httpx.RequestError as e:
+                    raise FetchError(f"Request failed fetching {current_url}: {e}") from e
+                # Success for this candidate (either redirect or body)
+                _hop_success = True
+                break
+            if not _hop_success:
+                if _last_connect_error is not None:
+                    raise FetchError(f"Connection failed for {current_url}: {_last_connect_error}") from _last_connect_error
+                # No candidate succeeded but no exception – should be unreachable
+                raise FetchError(f"Fetch failed for {current_url} (no pinned candidate succeeded)")
 
             if redirect_next is not None:
                 visited.add(current_url)
@@ -283,31 +330,50 @@ class WebReader:
             raise FetchError(f"Too many redirects (> {_MAX_REDIRECTS}) starting from {url}")
 
         assert body_bytes is not None and final_url is not None
-        # PDF branch — extract via pypdf if available (10 MiB already enforced, limit 20 pages)
+        # PDF branch — extract via pypdf in isolated subprocess (10 MiB already enforced, limit 20 pages)
         _ct_low_pdf = (final_content_type or "").lower().split(";")[0].strip()
         if _ct_low_pdf == "application/pdf":
             try:
-                import pypdf  # type: ignore
+                import pypdf  # type: ignore  # noqa: F401
             except ImportError as e:
                 raise UnsupportedContentTypeError(
                     f"PDF support not installed for {final_url} — install with `pip install -e \".[pdf]\"` or `uv sync --extra pdf`",
                     hint="PDF reader is optional",
                 ) from e
             try:
-                _pdf_reader = pypdf.PdfReader(io.BytesIO(body_bytes))
-                _texts: list[str] = []
-                for _page in _pdf_reader.pages[:20]:
-                    try:
-                        _t = _page.extract_text() or ""
-                        _texts.append(_t)
-                        if sum(len(x) for x in _texts) > max_chars + 5000:
-                            break
-                    except Exception:
-                        continue
-                extracted_pdf = "\n\n".join(_texts).strip()
-                if not extracted_pdf:
-                    raise ExtractionError(f"PDF extraction returned empty for {final_url}", hint="scanned PDF may be image-only")
-                truncated_pdf, truncated_flag_pdf = _truncate(extracted_pdf, max_chars)
+                # Isolate parser in subprocess with wall-clock limit (prevent OOM/CPU in main process)
+                _extracted_pdf: str | None = None
+                _pages_total: int | None = None
+                _pages_read: int | None = None
+                try:
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=1) as _pool:
+                        _future = _pool.submit(_pdf_extract_worker, (body_bytes, max_chars))
+                        _extracted_pdf, _pages_total, _pages_read = _future.result(timeout=10)
+                except concurrent.futures.TimeoutError as e:
+                    raise ExtractionError(f"PDF extraction timed out for {final_url} (10s)", hint="large or malformed PDF") from e
+                except Exception as e:
+                    # Fallback: try in-process for environments where fork is restricted (e.g., some CI)
+                    # Only fallback if the process pool itself failed to start, not for PDF parse errors
+                    if "cannot pickle" in str(type(e)).lower() or "process" in str(e).lower():
+                        try:
+                            _extracted_pdf, _pages_total, _pages_read = _pdf_extract_worker((body_bytes, max_chars))
+                        except Exception as ie:
+                            raise ExtractionError(f"PDF extraction failed for {final_url}: {ie}") from ie
+                    else:
+                        raise ExtractionError(f"PDF extraction failed for {final_url}: {e}") from e
+                if _extracted_pdf is None or not _extracted_pdf.strip():
+                    raise ExtractionError(f"PDF extraction returned empty for {final_url}", hint="scanned PDF may be image-only (OCR required)")
+                truncated_pdf, truncated_flag_pdf = _truncate(_extracted_pdf, max_chars)
+                # Partial if page limit hit or char limit hit
+                _is_partial = False
+                _partial_reason: str | None = None
+                if _pages_total is not None and _pages_read is not None and _pages_total > _pages_read:
+                    _is_partial = True
+                    _partial_reason = "page_limit"
+                    truncated_flag_pdf = True
+                if truncated_flag_pdf and not _is_partial:
+                    _is_partial = True
+                    _partial_reason = "char_limit"
                 resp_pdf = ReadResponse(
                     url=url,
                     final_url=final_url,
@@ -317,6 +383,10 @@ class WebReader:
                     truncated=truncated_flag_pdf,
                     characters=len(truncated_pdf),
                     engine="pypdf",
+                    pages_total=_pages_total,
+                    pages_read=_pages_read,
+                    partial=_is_partial,
+                    partial_reason=_partial_reason,
                 )
                 if not no_cache:
                     if len(_READ_CACHE) >= _READ_CACHE_MAX:

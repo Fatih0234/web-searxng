@@ -86,10 +86,15 @@ class ReadResponse:
     truncated: bool
     characters: int
     # optional extra metadata, kept backward-compatible
-    engine: str | None = None  # trafilatura vs fallback
+    engine: str | None = None  # trafilatura / trafilatura-fallback / raw / pypdf
+    # PDF / provenance metadata
+    pages_total: int | None = None
+    pages_read: int | None = None
+    partial: bool = False
+    partial_reason: str | None = None
 
     def to_dict(self) -> dict:
-        return {
+        d: dict = {
             "url": self.url,
             "final_url": self.final_url,
             "title": self.title,
@@ -97,7 +102,20 @@ class ReadResponse:
             "content": self.content,
             "truncated": self.truncated,
             "characters": self.characters,
+            "engine": self.engine,
         }
+        # Keep backward compat but expose new metadata when relevant
+        if self.pages_total is not None:
+            d["pages_total"] = self.pages_total
+        if self.pages_read is not None:
+            d["pages_read"] = self.pages_read
+        if self.partial:
+            d["partial"] = True
+            if self.partial_reason:
+                d["partial_reason"] = self.partial_reason
+        elif self.partial_reason:
+            d["partial_reason"] = self.partial_reason
+        return d
 
 
 @dataclass(slots=True)
@@ -108,9 +126,11 @@ class RuntimeStatus:
     url: str
     runtime_dir: str
     compose_exists: bool = False
+    searxng_image: str | None = None
+    searxng_version: str | None = None
 
     def to_dict(self) -> dict:
-        return {
+        d: dict = {
             "initialized": self.initialized,
             "docker_available": self.docker_available,
             "searxng_running": self.searxng_running,
@@ -118,6 +138,11 @@ class RuntimeStatus:
             "runtime_dir": self.runtime_dir,
             "compose_exists": self.compose_exists,
         }
+        if self.searxng_image is not None:
+            d["searxng_image"] = self.searxng_image
+        if self.searxng_version is not None:
+            d["searxng_version"] = self.searxng_version
+        return d
 
 
 @dataclass(slots=True)
@@ -137,6 +162,8 @@ class DoctorReport:
     mcp_version: str | None
     docker_error: str | None = None
     notes: list[str] = field(default_factory=list)
+    searxng_image: str | None = None
+    searxng_version: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -155,4 +182,6 @@ class DoctorReport:
             "mcp_version": self.mcp_version,
             "docker_error": self.docker_error,
             "notes": self.notes,
+            "searxng_image": self.searxng_image,
+            "searxng_version": self.searxng_version,
         }
