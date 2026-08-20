@@ -57,12 +57,13 @@ def _check_hostname_literal(host: str) -> None:
         pass
 
 
-def _resolve_and_check(host: str) -> None:
-    """Resolve hostname via OS resolver and deny if any IP is unsafe.
+def resolve_and_check(host: str) -> list[str]:
+    """Resolve hostname and deny if any IP is unsafe. Returns list of IP strings for pinning.
 
     Fails closed when DNS resolution cannot establish that the target is
     public — prevents proxy-mediated bypass where a local resolver cannot
     resolve an internal name but a corporate HTTP proxy could.
+    Public for reader pinning (http only).
     """
     try:
         infos = socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
@@ -77,6 +78,7 @@ def _resolve_and_check(host: str) -> None:
             hint="unable to verify target is public — blocked",
         ) from e
 
+    ips: list[str] = []
     for family, type_, proto, canonname, sockaddr in infos:
         ip_str = sockaddr[0]
         # Remove zone id if present
@@ -88,6 +90,15 @@ def _resolve_and_check(host: str) -> None:
             continue
         if _is_deny_ip(ip):
             raise UnsafeUrlError(f"URL resolves to disallowed address: {host} -> {ip_str}", hint="private/local network targets are intentionally blocked")
+        ips.append(ip_str)
+    if not ips:
+        raise UnsafeUrlError(f"DNS resolution returned no addresses for {host!r}", hint="unable to verify target is public — blocked")
+    return ips
+
+
+def _resolve_and_check(host: str) -> None:
+    """Legacy wrapper — validates but discards IP list."""
+    resolve_and_check(host)
 
 
 def validate_url(url_str: str, config: WebXConfig | None = None) -> urllib.parse.ParseResult:

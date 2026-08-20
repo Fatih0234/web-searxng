@@ -64,6 +64,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-tables", action="store_true", help="omit tables")
     sp.add_argument("--precision", action="store_true", help="favor precision")
     sp.add_argument("--recall", action="store_true", help="favor recall")
+    sp.add_argument("--no-cache", action="store_true", help="bypass read cache")
 
     return p
 
@@ -224,6 +225,7 @@ def _dispatch(args: argparse.Namespace, verbose: bool) -> int:
             include_tables=not args.no_tables,
             precision=args.precision,
             recall=args.recall,
+            no_cache=args.no_cache,
         )
         if verbose and t0 is not None:
             elapsed = time.monotonic() - t0

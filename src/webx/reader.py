@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import io
+import sys
 import time
 import urllib.parse
 
@@ -12,7 +15,7 @@ from . import __version__
 from .config import WebXConfig
 from .errors import ExtractionError, FetchError, UnsupportedContentTypeError, UnsafeUrlError
 from .models import ReadResponse
-from .security import validate_url
+from .security import resolve_and_check, validate_url
 
 _MAX_REDIRECTS = 5
 
@@ -33,6 +36,8 @@ def _is_allowed_content_type(ct: str) -> bool:
         return True
     ct = ct.split(";")[0].strip().lower()
     if not ct:
+        return True
+    if ct == "application/pdf":
         return True
     if ct.startswith(_ALLOWED_PREFIXES):
         return True
@@ -64,6 +69,17 @@ def _truncate(content: str, max_chars: int) -> tuple[str, bool]:
     return truncated, True
 
 
+# In-memory LRU cache for reads (per process, TTL 5min, max 20 entries)
+_READ_CACHE: dict[str, tuple[float, ReadResponse]] = {}
+_READ_CACHE_TTL = 300.0
+_READ_CACHE_MAX = 20
+
+
+def _cache_key(url: str, max_chars: int, include_links: bool, include_tables: bool, precision: bool, recall: bool) -> str:
+    raw = f"{url}|{max_chars}|{include_links}|{include_tables}|{precision}|{recall}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
 class WebReader:
     def __init__(self, config: WebXConfig) -> None:
         self.config = config
@@ -76,11 +92,19 @@ class WebReader:
         include_tables: bool = True,
         precision: bool = False,
         recall: bool = False,
+        no_cache: bool = False,
     ) -> ReadResponse:
         if max_chars is None:
             max_chars = self.config.max_read_chars
         if max_chars < 1000 or max_chars > 500000:
             raise FetchError(f"max_chars out of range: {max_chars}")
+
+        # Cache check (per-process, TTL)
+        cache_key = _cache_key(url, max_chars, include_links, include_tables, precision, recall)
+        if not no_cache:
+            cached = _READ_CACHE.get(cache_key)
+            if cached and (time.monotonic() - cached[0] < _READ_CACHE_TTL):
+                return cached[1]
 
         current_url = url
         visited: set[str] = set()
@@ -100,6 +124,36 @@ class WebReader:
             # Validate every hop
             validate_url(current_url, self.config)
 
+            # DNS pinning for http (mitigate rebinding TOCTOU). For https, SNI makes IP pinning complex,
+            # so we keep double-resolve + redirect re-validation. For http, replace host with pinned IP.
+            pinned_url = current_url
+            pin_headers: dict[str, str] = {}
+            _parsed_pin = urllib.parse.urlparse(current_url)
+            if _parsed_pin.scheme.lower() == "http" and _parsed_pin.hostname:
+                try:
+                    import ipaddress as _ipaddr_pin
+
+                    _is_literal = True
+                    try:
+                        _ipaddr_pin.ip_address(_parsed_pin.hostname.strip("[]"))
+                    except ValueError:
+                        _is_literal = False
+                    if not _is_literal:
+                        _ips = resolve_and_check(_parsed_pin.hostname)
+                        _ip = _ips[0]
+                        _host = f"[{_ip}]" if ":" in _ip and not _ip.startswith("[") else _ip
+                        _port = f":{_parsed_pin.port}" if _parsed_pin.port else ""
+                        _path = _parsed_pin.path or "/"
+                        _query = f"?{_parsed_pin.query}" if _parsed_pin.query else ""
+                        _frag = f"#{_parsed_pin.fragment}" if _parsed_pin.fragment else ""
+                        pinned_url = f"http://{_host}{_port}{_path}{_query}{_frag}"
+                        pin_headers["Host"] = _parsed_pin.hostname if not _parsed_pin.port else f"{_parsed_pin.hostname}:{_parsed_pin.port}"
+                except UnsafeUrlError:
+                    raise
+                except Exception:
+                    pinned_url = current_url
+                    pin_headers = {}
+
             # Remaining time bounds all network waits for this hop
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -114,12 +168,13 @@ class WebReader:
                 "User-Agent": _get_user_agent(),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
             }
+            headers.update(pin_headers)
 
             redirect_next: str | None = None
 
             try:
                 with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
-                    with client.stream("GET", current_url, headers=headers) as resp:
+                    with client.stream("GET", pinned_url, headers=headers) as resp:
                         # Redirect handling
                         if resp.status_code in (301, 302, 303, 307, 308):
                             location = resp.headers.get("location")
@@ -228,6 +283,51 @@ class WebReader:
             raise FetchError(f"Too many redirects (> {_MAX_REDIRECTS}) starting from {url}")
 
         assert body_bytes is not None and final_url is not None
+        # PDF branch — extract via pypdf if available (10 MiB already enforced, limit 20 pages)
+        _ct_low_pdf = (final_content_type or "").lower().split(";")[0].strip()
+        if _ct_low_pdf == "application/pdf":
+            try:
+                import pypdf  # type: ignore
+            except ImportError as e:
+                raise UnsupportedContentTypeError(
+                    f"PDF support not installed for {final_url} — install with `pip install -e \".[pdf]\"` or `uv sync --extra pdf`",
+                    hint="PDF reader is optional",
+                ) from e
+            try:
+                _pdf_reader = pypdf.PdfReader(io.BytesIO(body_bytes))
+                _texts: list[str] = []
+                for _page in _pdf_reader.pages[:20]:
+                    try:
+                        _t = _page.extract_text() or ""
+                        _texts.append(_t)
+                        if sum(len(x) for x in _texts) > max_chars + 5000:
+                            break
+                    except Exception:
+                        continue
+                extracted_pdf = "\n\n".join(_texts).strip()
+                if not extracted_pdf:
+                    raise ExtractionError(f"PDF extraction returned empty for {final_url}", hint="scanned PDF may be image-only")
+                truncated_pdf, truncated_flag_pdf = _truncate(extracted_pdf, max_chars)
+                resp_pdf = ReadResponse(
+                    url=url,
+                    final_url=final_url,
+                    title=None,
+                    content_type=final_content_type,
+                    content=truncated_pdf,
+                    truncated=truncated_flag_pdf,
+                    characters=len(truncated_pdf),
+                    engine="pypdf",
+                )
+                if not no_cache:
+                    if len(_READ_CACHE) >= _READ_CACHE_MAX:
+                        oldest = min(_READ_CACHE, key=lambda k: _READ_CACHE[k][0])
+                        _READ_CACHE.pop(oldest, None)
+                    _READ_CACHE[cache_key] = (time.monotonic(), resp_pdf)
+                return resp_pdf
+            except (ExtractionError, UnsupportedContentTypeError):
+                raise
+            except Exception as e:
+                raise ExtractionError(f"PDF extraction failed for {final_url}: {e}") from e
         # Decode — keep full Content-Type for charset, not the stripped MIME.
         encoding = "utf-8"
         ct_for_charset = final_content_type_full or ""
@@ -320,7 +420,7 @@ class WebReader:
 
         truncated_content, truncated = _truncate(extracted, max_chars)
 
-        return ReadResponse(
+        resp = ReadResponse(
             url=url,
             final_url=final_url,
             title=title,
@@ -330,3 +430,9 @@ class WebReader:
             characters=len(truncated_content),
             engine=engine,
         )
+        if not no_cache:
+            if len(_READ_CACHE) >= _READ_CACHE_MAX:
+                oldest = min(_READ_CACHE, key=lambda k: _READ_CACHE[k][0])
+                _READ_CACHE.pop(oldest, None)
+            _READ_CACHE[cache_key] = (time.monotonic(), resp)
+        return resp

@@ -97,6 +97,7 @@ def test_cli_doctor_not_start(monkeypatch, tmp_path):
         mp.assert_called()
 
 def test_cli_read_unsupported_type(monkeypatch, tmp_path, capsys):
+    # image/png is still unsupported (exit 7) — pdf is now supported via pypdf (exit 0 or 6)
     monkeypatch.setenv("WEBX_DATA_DIR", str(tmp_path / "webx-unsup"))
     monkeypatch.setattr(socket, "getaddrinfo", fake_public)
     from webx.config import get_config
@@ -105,8 +106,50 @@ def test_cli_read_unsupported_type(monkeypatch, tmp_path, capsys):
     init_runtime(cfg)
     mock_resp = mock.MagicMock()
     mock_resp.status_code = 200
+    mock_resp.headers = {"content-type": "image/png"}
+    mock_resp.iter_bytes.return_value = [b"\x89PNG"]
+    ms = mock.MagicMock()
+    ms.__enter__.return_value = mock_resp
+    ms.__exit__.return_value = False
+    mock_client = mock.MagicMock()
+    mock_client.stream.return_value = ms
+    mock_client.__enter__.return_value = mock_client
+    mock_client.__exit__.return_value = False
+    monkeypatch.setattr("webx.reader.httpx.Client", lambda *a, **kw: mock_client)
+    from webx.cli import main
+    ret = main(["read", "http://example.com/file.png"])
+    assert ret == 7
+
+
+def test_cli_read_pdf(monkeypatch, tmp_path, capsys):
+    # pdf is now supported when pypdf is installed
+    try:
+        import pypdf  # noqa: F401
+        has_pypdf = True
+    except ImportError:
+        has_pypdf = False
+    if not has_pypdf:
+        pytest.skip("pypdf not installed")
+    monkeypatch.setenv("WEBX_DATA_DIR", str(tmp_path / "webx-pdf"))
+    monkeypatch.setattr(socket, "getaddrinfo", fake_public)
+    from webx.config import get_config
+    from webx.lifecycle import init_runtime
+    cfg = get_config()
+    init_runtime(cfg)
+    # create a valid pdf in memory via pypdf
+    import io
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    # need at least one page with text — add via simple canvas? blank is ok but extract_text will be empty -> ExtractionError
+    # So we create pdf with text using reportlab if available, else just test that pdf path is allowed (not 7)
+    # For now, test that pdf content-type is not rejected as 7, but extraction may be 6 for blank
+    buf = io.BytesIO()
+    writer.write(buf)
+    pdf_bytes = buf.getvalue()
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 200
     mock_resp.headers = {"content-type": "application/pdf"}
-    mock_resp.iter_bytes.return_value = [b"%PDF"]
+    mock_resp.iter_bytes.return_value = [pdf_bytes]
     ms = mock.MagicMock()
     ms.__enter__.return_value = mock_resp
     ms.__exit__.return_value = False
@@ -117,7 +160,8 @@ def test_cli_read_unsupported_type(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr("webx.reader.httpx.Client", lambda *a, **kw: mock_client)
     from webx.cli import main
     ret = main(["read", "http://example.com/file.pdf"])
-    assert ret == 7
+    # blank pdf has no text -> ExtractionError (6), not Unsupported (7)
+    assert ret == 6
 
 def test_cli_logs(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("WEBX_DATA_DIR", str(tmp_path / "webx-logs"))

@@ -6,6 +6,15 @@ import pytest
 from webx.config import WebXConfig
 from webx.errors import FetchError, UnsupportedContentTypeError, UnsafeUrlError, ExtractionError
 
+
+@pytest.fixture(autouse=True)
+def clear_reader_cache():
+    from webx import reader as _reader_mod
+
+    _reader_mod._READ_CACHE.clear()
+    yield
+    _reader_mod._READ_CACHE.clear()
+
 # Tests use mocked http://example.com — live httpbin.org is flaky (503 from some nets, verified 2026-08-20) — see README for stable alternatives.
 
 def make_cfg(**overrides):
