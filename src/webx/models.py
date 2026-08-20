@@ -107,6 +107,7 @@ class RuntimeStatus:
     searxng_running: bool
     url: str
     runtime_dir: str
+    compose_exists: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -115,6 +116,7 @@ class RuntimeStatus:
             "searxng_running": self.searxng_running,
             "url": self.url,
             "runtime_dir": self.runtime_dir,
+            "compose_exists": self.compose_exists,
         }
 
 

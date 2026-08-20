@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 
 from . import __version__
 from .config import get_config
@@ -155,10 +156,14 @@ def _dispatch(args: argparse.Namespace, verbose: bool) -> int:
             print(json.dumps(st.to_dict()))
         else:
             print(f"initialized: {st.initialized}")
+            print(f"compose: {'present' if st.compose_exists else 'missing'}")
             print(f"docker: {'available' if st.docker_available else 'unavailable'}")
             print(f"SearXNG running: {st.searxng_running}")
             print(f"url: {st.url}")
             print(f"runtime: {st.runtime_dir}")
+            # Hint when global container from other WEBX_DATA_DIR is running but local compose missing
+            if st.searxng_running and not st.compose_exists:
+                print("note: SearXNG is running but local compose.yml missing — global container from another WEBX_DATA_DIR (single webx-searxng name shared)", file=sys.stderr)
         return 0
 
     if args.command == "logs":
@@ -209,6 +214,8 @@ def _dispatch(args: argparse.Namespace, verbose: bool) -> int:
         if max_chars < 1000 or max_chars > 500000:
             print("error: --max-chars out of range (1000-500000)", file=sys.stderr)
             return 2
+        # verbose timing — keep library pure, measure in CLI
+        t0 = time.monotonic() if verbose else None
         # mutually exclusive precision/recall? not required
         resp = core.read(
             url=args.url,
@@ -218,6 +225,12 @@ def _dispatch(args: argparse.Namespace, verbose: bool) -> int:
             precision=args.precision,
             recall=args.recall,
         )
+        if verbose and t0 is not None:
+            elapsed = time.monotonic() - t0
+            print(
+                f"read ok: {resp.final_url} {resp.content_type or 'unknown'} {resp.characters} chars engine={resp.engine or 'unknown'} {elapsed:.2f}s",
+                file=sys.stderr,
+            )
         if args.json_output:
             print(json.dumps(resp.to_dict(), ensure_ascii=False))
         else:

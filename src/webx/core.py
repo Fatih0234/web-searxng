@@ -18,10 +18,12 @@ class WebX:
         client = SearxngClient(self.config)
         return client.search(query, limit, category, language, page, time_range, safe_search, engines)
 
-    def read(self, url: str, max_chars: int = 40000, include_links: bool = False, include_tables: bool = True, precision: bool = False, recall: bool = False) -> ReadResponse:
+    def read(self, url: str, max_chars: int = 40000, include_links: bool = False, include_tables: bool = True, precision: bool = False, recall: bool = False, verbose: bool = False) -> ReadResponse:
         from .reader import WebReader
 
         reader = WebReader(self.config)
+        # verbose is handled in cli layer to keep library pure for MCP; accept for forward-compat
+        _ = verbose
         return reader.read(url, max_chars, include_links, include_tables, precision, recall)
 
     def start_search_service(self):

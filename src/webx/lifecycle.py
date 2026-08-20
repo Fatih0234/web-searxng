@@ -131,7 +131,8 @@ def _compose_version(cfg: WebXConfig) -> str | None:
 
 
 def status(cfg: WebXConfig) -> RuntimeStatus:
-    initialized = cfg.compose_file.exists() and cfg.settings_file.exists()
+    compose_exists = cfg.compose_file.exists()
+    initialized = compose_exists and cfg.settings_file.exists()
     docker_av = _docker_available(cfg)
     running = False
     try:
@@ -144,6 +145,7 @@ def status(cfg: WebXConfig) -> RuntimeStatus:
         searxng_running=running,
         url=cfg.searxng_url,
         runtime_dir=str(cfg.runtime_dir),
+        compose_exists=compose_exists,
     )
 
 
@@ -352,6 +354,8 @@ def compose_stop(cfg: WebXConfig, verbose: bool = False) -> subprocess.Completed
 
 
 def compose_logs(cfg: WebXConfig, tail: int = 100, verbose: bool = False) -> str:
+    if not cfg.compose_file.exists():
+        return "no runtime compose file — run `webx init` to materialize templates"
     if not _docker_available(cfg):
         return "docker not available"
     try:
@@ -361,6 +365,22 @@ def compose_logs(cfg: WebXConfig, tail: int = 100, verbose: bool = False) -> str
             text=True,
             timeout=10,
         )
-        return r.stdout + r.stderr
+        output = (r.stdout or "") + (r.stderr or "")
+        if output.strip():
+            return output
+        # Empty output — distinguish stopped vs error.
+        # When compose file missing or service not running, docker compose logs is empty with returncode 0.
+        # Provide hint instead of silent empty.
+        try:
+            running = _probe(cfg.searxng_url, timeout=2.0)
+        except Exception:
+            running = False
+        if not running:
+            # Also check if compose file itself missing — more precise hint
+            if not cfg.compose_file.exists():
+                return "no runtime compose file — run `webx init` to materialize templates"
+            return "SearXNG not running — no container logs (run `webx up` or `webx search` to start)"
+        # Running but no logs yet (fresh container) — return empty-ish but not hint
+        return output if output else "(no logs yet)"
     except Exception as e:
         return f"logs error: {e}"

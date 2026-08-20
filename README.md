@@ -24,10 +24,19 @@ uv sync --extra dev      # for tests
 pip install -e .
 pip install -e ".[mcp]"
 
-# global tool
-uv tool install .
-webx --help
+# global tool (so `webx` works in `pi`'s bash and any shell)
+uv tool install .        # installs to ~/.local/bin/webx — ensure ~/.local/bin is on PATH
+# or pipx
+pipx install .
+
+# per-project (no global install)
+uv sync && uv run webx --help
+# or add .venv/bin to PATH for this shell/session (useful for pi coding agent)
+export PATH="$PWD/.venv/bin:$PATH"
+which webx && webx --help
 ```
+
+> **pi coding agent note:** The `bash` tool inside `pi` inherits `PATH` from the host. If `webx: command not found`, run `uv tool install .` once or `export PATH="$PWD/.venv/bin:$PATH"` in the session where you launch `pi`.
 
 ## Quick start
 
@@ -98,9 +107,9 @@ webx read URL [--max-chars N] [--json] [--links] [--no-tables] [--precision] [--
 ```
 
 * `stdout` = data (JSON for search, Markdown/text or JSON for read).  `stderr` = diagnostics.
-* Exit codes: `0` ok, `2` usage/validation, `3` runtime/docker unavailable, `4` SearXNG failure, `5` unsafe URL, `6` fetch/extraction failure, `7` unsupported content type.
+* Exit codes: `0` ok, `2` usage/validation, `3` runtime/docker unavailable, `4` SearXNG failure, `5` unsafe URL, `6` fetch/extraction failure, `7` unsupported content type (`2xx` with `image/*`, `application/pdf`, etc.). `4xx`/`5xx`/timeout from a public URL is `6`, not `7` (e.g. `wikimedia PNG -> HTTP 400` -> `6`).
 
-`--verbose` (global) enables debug traces. Secrets never printed.
+`--verbose` (global) enables debug traces to `stderr` (e.g. `read ok: https://example.com/ text/html 114 chars engine=trafilatura 1.23s`). Secrets never printed.
 
 ## Runtime & config
 
@@ -192,6 +201,9 @@ Tool descriptions state the trust boundary: returned page text is **untrusted ex
 | SearXNG starts but searches 0 results / 5xx | Upstream engines rate-limited / CAPTCHAd your IP — not a WebX bug; try different query/category |
 | Reader returns tiny text | JS-rendered page — try `--recall` or different source; browser rendering is out of scope for v1 |
 | Reader rejects URL | Private/local network denial — intentional |
+| `webx logs` empty | `SearXNG not running` — `webx logs` now hints `run webx up or webx search to start` instead of silent empty |
+| `WEBX_DATA_DIR=/tmp/... webx status` says `running:true` but `compose missing` | Single `webx-searxng` container name shared across dirs — `status` now shows `compose: missing` + note; probe is global `127.0.0.1:8888` |
+| `webx: command not found` in `pi` | `~/.local/bin` not on `PATH` — see Install ( `uv tool install` / `export PATH="$PWD/.venv/bin:$PATH"` ) |
 
 Research heuristics (agent-side, not WebX): prefer official docs → upstream repo/notes → specs → vendor announcements → quality writing; use `--category it` when it helps; run multiple focused searches, read primary sources, search for contradictions.
 
